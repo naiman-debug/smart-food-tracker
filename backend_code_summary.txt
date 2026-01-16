@@ -1,0 +1,829 @@
+================================================================================
+智能食物记录 - 后端核心代码汇总
+================================================================================
+
+数据模型设计（三表架构）
+================================================================================
+
+表 1：VisualPortion（视觉份量知识库）
+- 每条记录 = 某种食物 + 某种视觉份量的完整营养定义
+- 字段：id, food_name, portion_name, weight_grams, calories_per_100g, protein_per_100g
+
+表 2：MealRecord（饮食记录）
+- 字段：id, image_url, food_name, visual_portion_id, calories, protein, record_date
+- 营养数据从 VisualPortion 计算
+
+表 3：DailyGoal（每日目标）
+- 字段：id, gender, age, height_cm, weight_kg, deficit_target, calorie_target, protein_target
+- 使用 Mifflin-St Jeor 公式计算 BMR/TDEE
+
+================================================================================
+文件：backend/app/models/visual_portion.py
+================================================================================
+
+"""
+视觉份量知识库模型 - 每条记录 = 某种食物 + 某种视觉份量的完整营养定义
+"""
+from sqlalchemy import Column, Integer, String, Float
+from sqlalchemy.orm import relationship
+from .database import Base
+
+
+class VisualPortion(Base):
+    """视觉份量知识库"""
+    __tablename__ = "visual_portions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    food_name = Column(String(100), nullable=False, index=True)
+    portion_name = Column(String(100), nullable=False)
+    weight_grams = Column(Float, nullable=False)
+    calories_per_100g = Column(Float, nullable=False)
+    protein_per_100g = Column(Float, nullable=False)
+
+    # 关系
+    meal_records = relationship("MealRecord", back_populates="visual_portion")
+
+    def get_calories(self) -> float:
+        """计算该份量的热量"""
+        return (self.weight_grams / 100) * self.calories_per_100g
+
+    def get_protein(self) -> float:
+        """计算该份量的蛋白质"""
+        return (self.weight_grams / 100) * self.protein_per_100g
+
+    def __repr__(self):
+        return f"<VisualPortion({self.food_name} - {self.portion_name}, {self.weight_grams}g)>"
+
+================================================================================
+文件：backend/app/models/meal_record.py
+================================================================================
+
+"""
+饮食记录模型 - 唯一数据源
+"""
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey
+from sqlalchemy.orm import relationship
+from datetime import datetime
+from .database import Base
+
+
+class MealRecord(Base):
+    """饮食记录 - 唯一数据源"""
+    __tablename__ = "meal_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    image_url = Column(String(500), nullable=False)
+    food_name = Column(String(100), nullable=False)  # AI 识别的食物名称
+    visual_portion_id = Column(Integer, ForeignKey("visual_portions.id"), nullable=False)
+    calories = Column(Float, nullable=False)  # 从 VisualPortion 计算
+    protein = Column(Float, nullable=False)   # 从 VisualPortion 计算
+    record_date = Column(DateTime, default=datetime.utcnow, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # 关系
+    visual_portion = relationship("VisualPortion", back_populates="meal_records")
+
+    def __repr__(self):
+        return f"<MealRecord({self.food_name}, {self.calories}kcal, {self.record_date})>"
+
+================================================================================
+文件：backend/app/models/daily_goal.py
+================================================================================
+
+"""
+每日目标模型
+"""
+from sqlalchemy import Column, Integer, String, Float, DateTime
+from datetime import datetime
+from .database import Base
+
+
+class DailyGoal(Base):
+    """每日目标 - 新目标覆盖旧目标"""
+    __tablename__ = "daily_goals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    gender = Column(String(10), nullable=False)  # "男" 或 "女"
+    age = Column(Integer, nullable=False)
+    height_cm = Column(Float, nullable=False)
+    weight_kg = Column(Float, nullable=False)
+    deficit_target = Column(Integer, nullable=False)  # 热量缺口：0/-300/-500/-800
+    calorie_target = Column(Float, nullable=False)    # 计算得出的每日热量目标
+    protein_target = Column(Float, nullable=False)    # 计算得出的每日蛋白质目标
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def calculate_targets(self):
+        """
+        根据身体数据和热量缺口计算每日目标
+
+        BMR 计算公式（Mifflin-St Jeor）：
+        - 男性：BMR = 10 × 体重kg + 6.25 × 身高cm - 5 × 年龄 + 5
+        - 女性：BMR = 10 × 体重kg + 6.25 × 身高cm - 5 × 年龄 - 161
+
+        TDEE = BMR × 活动系数（假设久坐 1.2）
+        每日目标 = TDEE + 热量缺口
+
+        蛋白质目标 = 体重kg × 1.6g（减脂期推荐）
+        """
+        # 计算 BMR
+        if self.gender == "男":
+            bmr = 10 * self.weight_kg + 6.25 * self.height_cm - 5 * self.age + 5
+        else:
+            bmr = 10 * self.weight_kg + 6.25 * self.height_cm - 5 * self.age - 161
+
+        # TDEE（假设久坐，活动系数 1.2）
+        tdee = bmr * 1.2
+
+        # 每日热量目标
+        self.calorie_target = tdee + self.deficit_target
+
+        # 蛋白质目标（减脂期推荐 1.6g/kg）
+        self.protein_target = self.weight_kg * 1.6
+
+    @classmethod
+    def get_latest_goal(cls, db):
+        """获取最新的目标"""
+        return db.query(cls).order_by(cls.created_at.desc()).first()
+
+    def __repr__(self):
+        return f"<DailyGoal({self.calorie_target:.0f}kcal, {self.protein_target:.0f}g protein)>"
+
+================================================================================
+文件：backend/app/api/meal.py
+================================================================================
+
+"""
+饮食记录核心 API
+"""
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from typing import Optional
+from datetime import datetime, date, timedelta
+from ..models.database import get_db
+from ..models.visual_portion import VisualPortion
+from ..models.meal_record import MealRecord
+from ..models.daily_goal import DailyGoal
+from pydantic import BaseModel
+import random
+
+
+router = APIRouter(prefix="/api", tags=["meal"])
+
+
+# ============ 请求/响应模型 ============
+
+class AnalyzeImageRequest(BaseModel):
+    image_base64: str
+
+
+class PortionOption(BaseModel):
+    id: int
+    food_name: str
+    portion_name: str
+    weight_grams: float
+    calories: float
+    protein: float
+
+    class Config:
+        from_attributes = True
+
+
+class AnalyzeImageResponse(BaseModel):
+    food_name: str
+    portion_options: list[PortionOption]
+
+
+class CreateRecordRequest(BaseModel):
+    image_url: str
+    food_name: str
+    visual_portion_id: int
+
+
+class MealRecordResponse(BaseModel):
+    id: int
+    image_url: str
+    food_name: str
+    visual_portion_id: int
+    calories: float
+    protein: float
+    record_date: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class DailyBalanceResponse(BaseModel):
+    remaining_calories: float
+    remaining_protein: float
+    consumed_calories: float
+    consumed_protein: float
+    target_calories: float
+    target_protein: float
+    meals_count: int
+
+
+class ProgressResponse(BaseModel):
+    total_calorie_deficit: float
+    estimated_fat_lost: float
+    days_tracked: int
+    data_points: list
+    encouragement: str
+
+
+class SetGoalRequest(BaseModel):
+    gender: str
+    age: int
+    height_cm: float
+    weight_kg: float
+    deficit_target: int
+
+
+class GoalResponse(BaseModel):
+    id: int
+    gender: str
+    age: int
+    height_cm: float
+    weight_kg: float
+    deficit_target: int
+    calorie_target: float
+    protein_target: float
+
+    class Config:
+        from_attributes = True
+
+
+# ============ AI 模拟识别 ============
+
+# 模拟 AI 识别结果
+MOCK_FOODS = [
+    {"name": "鸡胸肉"},
+    {"name": "红烧肉"},
+    {"name": "米饭"},
+    {"name": "苹果"},
+    {"name": "生菜沙拉"},
+    {"name": "鸡蛋"},
+]
+
+
+def mock_analyze_image(image_base64: str) -> str:
+    """模拟 AI 图片识别，返回食物名称"""
+    return random.choice(MOCK_FOODS)["name"]
+
+
+# ============ API 端点 ============
+
+@router.post("/analyze", response_model=AnalyzeImageResponse)
+async def analyze_image(request: AnalyzeImageRequest, db: Session = Depends(get_db)):
+    """
+    分析食物图片
+    1. AI 识别食物名称
+    2. 查询 VisualPortion 获取该食物的份量选项
+    3. 返回份量选项（含计算好的热量和蛋白质）
+    """
+    # AI 识别
+    food_name = mock_analyze_image(request.image_base64)
+
+    # 查询该食物的份量选项
+    portions = db.query(VisualPortion).filter(
+        VisualPortion.food_name == food_name
+    ).all()
+
+    if not portions:
+        # 如果知识库中没有该食物，返回通用份量选项
+        raise HTTPException(
+            status_code=404,
+            detail=f"知识库中暂无「{food_name}」的数据"
+        )
+
+    # 构建响应，热量和蛋白质从 VisualPortion 计算
+    portion_options = [
+        PortionOption(
+            id=p.id,
+            food_name=p.food_name,
+            portion_name=p.portion_name,
+            weight_grams=p.weight_grams,
+            calories=p.get_calories(),
+            protein=p.get_protein()
+        )
+        for p in portions
+    ]
+
+    return AnalyzeImageResponse(
+        food_name=food_name,
+        portion_options=portion_options
+    )
+
+
+@router.post("/records", response_model=MealRecordResponse)
+async def create_record(request: CreateRecordRequest, db: Session = Depends(get_db)):
+    """
+    创建饮食记录
+    用户选择份量后调用此接口完成记录
+    """
+    # 查询 VisualPortion
+    portion = db.query(VisualPortion).filter(
+        VisualPortion.id == request.visual_portion_id
+    ).first()
+
+    if not portion:
+        raise HTTPException(status_code=404, detail="份量选项不存在")
+
+    # 创建记录（营养数据从 VisualPortion 计算）
+    record = MealRecord(
+        image_url=request.image_url,
+        food_name=request.food_name,
+        visual_portion_id=request.visual_portion_id,
+        calories=portion.get_calories(),
+        protein=portion.get_protein(),
+        record_date=datetime.utcnow()
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+
+    return record
+
+
+@router.get("/balance", response_model=DailyBalanceResponse)
+async def get_daily_balance(db: Session = Depends(get_db)):
+    """
+    获取今日余额
+    返回今日剩余的热量和蛋白质额度
+    """
+    # 获取目标
+    goal = DailyGoal.get_latest_goal(db)
+    if goal:
+        target_calories = goal.calorie_target
+        target_protein = goal.protein_target
+    else:
+        target_calories = 2000  # 默认值
+        target_protein = 120
+
+    # 计算今日已摄入
+    today = date.today()
+    start_of_day = datetime.combine(today, datetime.min.time())
+    end_of_day = datetime.combine(today, datetime.max.time())
+
+    result = db.query(
+        func.sum(MealRecord.calories).label("total_calories"),
+        func.sum(MealRecord.protein).label("total_protein"),
+        func.count(MealRecord.id).label("meals_count")
+    ).filter(
+        MealRecord.record_date >= start_of_day,
+        MealRecord.record_date <= end_of_day
+    ).first()
+
+    consumed_calories = result.total_calories or 0
+    consumed_protein = result.total_protein or 0
+    meals_count = result.meals_count or 0
+
+    return DailyBalanceResponse(
+        remaining_calories=max(0, target_calories - consumed_calories),
+        remaining_protein=max(0, target_protein - consumed_protein),
+        consumed_calories=consumed_calories,
+        consumed_protein=consumed_protein,
+        target_calories=target_calories,
+        target_protein=target_protein,
+        meals_count=meals_count
+    )
+
+
+@router.get("/progress", response_model=ProgressResponse)
+async def get_progress(
+    range: Optional[str] = "all",
+    db: Session = Depends(get_db)
+):
+    """
+    获取进度统计
+    range: week(本周), month(本月), all(全部)
+    """
+    # 获取目标
+    goal = DailyGoal.get_latest_goal(db)
+    if goal:
+        target_calories = goal.calorie_target
+    else:
+        target_calories = 2000
+
+    # 确定日期范围
+    end_date = date.today()
+    if range == "week":
+        start_date = end_date - timedelta(days=7)
+    elif range == "month":
+        start_date = end_date - timedelta(days=30)
+    else:  # all
+        start_date = date.min
+
+    # 查询记录
+    records = db.query(
+        func.date(MealRecord.record_date).label("date"),
+        func.sum(MealRecord.calories).label("calories")
+    ).filter(
+        MealRecord.record_date >= datetime.combine(start_date, datetime.min.time()),
+        MealRecord.record_date <= datetime.combine(end_date, datetime.max.time())
+    ).group_by(
+        func.date(MealRecord.record_date)
+    ).all()
+
+    # 计算每日缺口和累计
+    total_deficit = 0
+    data_points = []
+
+    for record in records:
+        daily_intake = record.calories or 0
+        daily_deficit = target_calories - daily_intake
+        total_deficit += daily_deficit
+
+        data_points.append({
+            "date": record.date.isoformat(),
+            "calorie_deficit": round(daily_deficit, 2),
+            "consumed_calories": round(daily_intake, 2)
+        })
+
+    # 估算减脂重量（7700kcal ≈ 1kg 脂肪）
+    estimated_fat_lost = total_deficit / 7700
+
+    return ProgressResponse(
+        total_calorie_deficit=round(total_deficit, 2),
+        estimated_fat_lost=round(estimated_fat_lost, 3),
+        days_tracked=len(records),
+        data_points=data_points,
+        encouragement=_generate_encouragement(total_deficit)
+    )
+
+
+@router.post("/goals", response_model=GoalResponse)
+async def set_goal(request: SetGoalRequest, db: Session = Depends(get_db)):
+    """
+    设置每日目标
+    新目标会覆盖旧目标
+    """
+    # 验证 deficit_target
+    if request.deficit_target not in [0, -300, -500, -800]:
+        raise HTTPException(
+            status_code=400,
+            detail="deficit_target 必须是 0, -300, -500 或 -800"
+        )
+
+    # 验证 gender
+    if request.gender not in ["男", "女"]:
+        raise HTTPException(
+            status_code=400,
+            detail="gender 必须是 '男' 或 '女'"
+        )
+
+    goal = DailyGoal(
+        gender=request.gender,
+        age=request.age,
+        height_cm=request.height_cm,
+        weight_kg=request.weight_kg,
+        deficit_target=request.deficit_target
+    )
+    goal.calculate_targets()
+
+    db.add(goal)
+    db.commit()
+    db.refresh(goal)
+
+    return goal
+
+
+@router.get("/goals", response_model=Optional[GoalResponse])
+async def get_current_goal(db: Session = Depends(get_db)):
+    """获取当前目标"""
+    return DailyGoal.get_latest_goal(db)
+
+
+def _generate_encouragement(deficit: float) -> str:
+    """根据进度生成鼓励语"""
+    if deficit > 0:
+        return "热量盈余，注意控制摄入！"
+    elif deficit > -1000:
+        return "好的开始，继续保持！"
+    elif deficit > -3500:
+        return "稳步前行，保持节奏！"
+    elif deficit > -7700:
+        return "非常棒！已经减掉约1kg脂肪！"
+    else:
+        return "太厉害了！你的坚持正在带来改变！"
+
+================================================================================
+API 端点列表
+================================================================================
+
+POST /api/analyze        # 分析食物图片，返回份量选项
+POST /api/records        # 创建饮食记录
+GET  /api/balance        # 今日余额
+GET  /api/progress       # 进度统计
+POST /api/goals          # 设置目标
+GET  /api/goals          # 获取当前目标
+
+================================================================================
+文件：backend/app/init_db.py
+================================================================================
+
+"""
+数据库初始化脚本 - VisualPortion 知识库
+"""
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from sqlalchemy.orm import Session
+from app.models.database import SessionLocal, engine, Base
+from app.models.visual_portion import VisualPortion
+from app.models.daily_goal import DailyGoal
+
+
+# 视觉份量知识库数据
+# 每条记录 = 某种食物 + 某种视觉份量的完整营养定义
+VISUAL_PORTIONS_DATA = [
+    # 肉类 - 掌心大小
+    {"food_name": "鸡胸肉", "portion_name": "掌心大小（薄切，约80g）", "weight_grams": 80, "calories_per_100g": 165, "protein_per_100g": 31},
+    {"food_name": "鸡胸肉", "portion_name": "掌心大小（正常厚度，约120g）", "weight_grams": 120, "calories_per_100g": 165, "protein_per_100g": 31},
+    {"food_name": "鸡胸肉", "portion_name": "掌心大小×1.5（厚切，约180g）", "weight_grams": 180, "calories_per_100g": 165, "protein_per_100g": 31},
+
+    {"food_name": "牛肉", "portion_name": "信用卡厚度×掌心大小（约60g）", "weight_grams": 60, "calories_per_100g": 250, "protein_per_100g": 26},
+    {"food_name": "牛肉", "portion_name": "掌心大小（约100g）", "weight_grams": 100, "calories_per_100g": 250, "protein_per_100g": 26},
+    {"food_name": "牛肉", "portion_name": "掌心大小×1.5（约150g）", "weight_grams": 150, "calories_per_100g": 250, "protein_per_100g": 26},
+
+    {"food_name": "猪肉", "portion_name": "掌心大小（薄切，约80g）", "weight_grams": 80, "calories_per_100g": 143, "protein_per_100g": 20},
+    {"food_name": "猪肉", "portion_name": "掌心大小（正常厚度，约120g）", "weight_grams": 120, "calories_per_100g": 143, "protein_per_100g": 20},
+    {"food_name": "猪肉", "portion_name": "掌心大小×1.5（厚切，约180g）", "weight_grams": 180, "calories_per_100g": 143, "protein_per_100g": 20},
+
+    {"food_name": "红烧肉", "portion_name": "掌心大小（约3-4块，100g）", "weight_grams": 100, "calories_per_100g": 358, "protein_per_100g": 10},
+    {"food_name": "红烧肉", "portion_name": "掌心大小×1.5（约5-6块，150g）", "weight_grams": 150, "calories_per_100g": 358, "protein_per_100g": 10},
+    {"food_name": "红烧肉", "portion_name": "双掌心大小（约200g）", "weight_grams": 200, "calories_per_100g": 358, "protein_per_100g": 10},
+
+    {"food_name": "鱼", "portion_name": "掌心大小（约100g）", "weight_grams": 100, "calories_per_100g": 140, "protein_per_100g": 25},
+    {"food_name": "鱼", "portion_name": "掌心大小×1.5（约150g）", "weight_grams": 150, "calories_per_100g": 140, "protein_per_100g": 25},
+    {"food_name": "鱼", "portion_name": "双掌心大小（约200g）", "weight_grams": 200, "calories_per_100g": 140, "protein_per_100g": 25},
+
+    {"food_name": "虾", "portion_name": "一小把（约5-6只，80g）", "weight_grams": 80, "calories_per_100g": 99, "protein_per_100g": 24},
+    {"food_name": "虾", "portion_name": "一大把（约10只，150g）", "weight_grams": 150, "calories_per_100g": 99, "protein_per_100g": 24},
+
+    # 主食 - 碗
+    {"food_name": "米饭", "portion_name": "半小碗（约50g）", "weight_grams": 50, "calories_per_100g": 130, "protein_per_100g": 2.7},
+    {"food_name": "米饭", "portion_name": "一小碗（约100g）", "weight_grams": 100, "calories_per_100g": 130, "protein_per_100g": 2.7},
+    {"food_name": "米饭", "portion_name": "平时饭碗的一碗半（约150g）", "weight_grams": 150, "calories_per_100g": 130, "protein_per_100g": 2.7},
+
+    {"food_name": "面条", "portion_name": "半小碗（约50g）", "weight_grams": 50, "calories_per_100g": 110, "protein_per_100g": 4},
+    {"food_name": "面条", "portion_name": "一小碗（约100g）", "weight_grams": 100, "calories_per_100g": 110, "protein_per_100g": 4},
+    {"food_name": "面条", "portion_name": "平时饭碗的一碗半（约150g）", "weight_grams": 150, "calories_per_100g": 110, "protein_per_100g": 4},
+
+    {"food_name": "馒头", "portion_name": "半个小馒头（约50g）", "weight_grams": 50, "calories_per_100g": 223, "protein_per_100g": 7},
+    {"food_name": "馒头", "portion_name": "一个小馒头（约100g）", "weight_grams": 100, "calories_per_100g": 223, "protein_per_100g": 7},
+    {"food_name": "馒头", "portion_name": "一个大馒头（约150g）", "weight_grams": 150, "calories_per_100g": 223, "protein_per_100g": 7},
+
+    {"food_name": "全麦面包", "portion_name": "一片（约30g）", "weight_grams": 30, "calories_per_100g": 246, "protein_per_100g": 9},
+    {"food_name": "全麦面包", "portion_name": "两片（约60g）", "weight_grams": 60, "calories_per_100g": 246, "protein_per_100g": 9},
+
+    # 蔬菜 - 双手捧
+    {"food_name": "青菜", "portion_name": "一手抓起的量（约30g）", "weight_grams": 30, "calories_per_100g": 25, "protein_per_100g": 2},
+    {"food_name": "青菜", "portion_name": "双手一捧（约80g）", "weight_grams": 80, "calories_per_100g": 25, "protein_per_100g": 2},
+    {"food_name": "青菜", "portion_name": "双手一捧×1.5（约120g）", "weight_grams": 120, "calories_per_100g": 25, "protein_per_100g": 2},
+
+    {"food_name": "生菜沙拉", "portion_name": "一手抓起的量（约30g）", "weight_grams": 30, "calories_per_100g": 20, "protein_per_100g": 1.5},
+    {"food_name": "生菜沙拉", "portion_name": "双手一捧（约80g）", "weight_grams": 80, "calories_per_100g": 20, "protein_per_100g": 1.5},
+    {"food_name": "生菜沙拉", "portion_name": "双手一捧×1.5（约120g）", "weight_grams": 120, "calories_per_100g": 20, "protein_per_100g": 1.5},
+
+    {"food_name": "西兰花", "portion_name": "一小朵（约50g）", "weight_grams": 50, "calories_per_100g": 34, "protein_per_100g": 2.8},
+    {"food_name": "西兰花", "portion_name": "一大朵（约100g）", "weight_grams": 100, "calories_per_100g": 34, "protein_per_100g": 2.8},
+    {"food_name": "西兰花", "portion_name": "满满一碗（约150g）", "weight_grams": 150, "calories_per_100g": 34, "protein_per_100g": 2.8},
+
+    {"food_name": "番茄", "portion_name": "一个番茄（约100g）", "weight_grams": 100, "calories_per_100g": 18, "protein_per_100g": 0.9},
+    {"food_name": "番茄", "portion_name": "两个番茄（约200g）", "weight_grams": 200, "calories_per_100g": 18, "protein_per_100g": 0.9},
+
+    {"food_name": "黄瓜", "portion_name": "半根黄瓜（约80g）", "weight_grams": 80, "calories_per_100g": 16, "protein_per_100g": 0.8},
+    {"food_name": "黄瓜", "portion_name": "一根黄瓜（约150g）", "weight_grams": 150, "calories_per_100g": 16, "protein_per_100g": 0.8},
+
+    # 水果 - 拳头/网球
+    {"food_name": "苹果", "portion_name": "网球大小（小苹果，约80g）", "weight_grams": 80, "calories_per_100g": 52, "protein_per_100g": 0.3},
+    {"food_name": "苹果", "portion_name": "拳头大小（正常苹果，约150g）", "weight_grams": 150, "calories_per_100g": 52, "protein_per_100g": 0.3},
+    {"food_name": "苹果", "portion_name": "拳头大小×1.5（大苹果，约225g）", "weight_grams": 225, "calories_per_100g": 52, "protein_per_100g": 0.3},
+
+    {"food_name": "香蕉", "portion_name": "半根香蕉（约60g）", "weight_grams": 60, "calories_per_100g": 89, "protein_per_100g": 1.1},
+    {"food_name": "香蕉", "portion_name": "一根香蕉（约120g）", "weight_grams": 120, "calories_per_100g": 89, "protein_per_100g": 1.1},
+
+    {"food_name": "橙子", "portion_name": "网球大小（小橙子，约100g）", "weight_grams": 100, "calories_per_100g": 47, "protein_per_100g": 0.9},
+    {"food_name": "橙子", "portion_name": "拳头大小（正常橙子，约180g）", "weight_grams": 180, "calories_per_100g": 47, "protein_per_100g": 0.9},
+
+    {"food_name": "葡萄", "portion_name": "一小串（约80g）", "weight_grams": 80, "calories_per_100g": 69, "protein_per_100g": 0.7},
+    {"food_name": "葡萄", "portion_name": "一大串（约150g）", "weight_grams": 150, "calories_per_100g": 69, "protein_per_100g": 0.7},
+
+    # 蛋类 & 豆制品
+    {"food_name": "鸡蛋", "portion_name": "一个水煮蛋（约50g）", "weight_grams": 50, "calories_per_100g": 155, "protein_per_100g": 13},
+    {"food_name": "鸡蛋", "portion_name": "两个水煮蛋（约100g）", "weight_grams": 100, "calories_per_100g": 155, "protein_per_100g": 13},
+
+    {"food_name": "豆腐", "portion_name": "一小块（约100g）", "weight_grams": 100, "calories_per_100g": 76, "protein_per_100g": 8},
+    {"food_name": "豆腐", "portion_name": "一大块（约200g）", "weight_grams": 200, "calories_per_100g": 76, "protein_per_100g": 8},
+]
+
+
+def init_db():
+    """初始化数据库"""
+    print("正在创建数据库表...")
+    Base.metadata.drop_all(bind=engine)
+    Base.metadata.create_all(bind=engine)
+
+    db: Session = SessionLocal()
+    try:
+        print("正在创建视觉份量知识库...")
+        for data in VISUAL_PORTIONS_DATA:
+            portion = VisualPortion(**data)
+            db.add(portion)
+
+        # 创建示例目标
+        print("正在创建示例用户目标...")
+        example_goal = DailyGoal(
+            gender="男",
+            age=28,
+            height_cm=175,
+            weight_kg=70,
+            deficit_target=-500
+        )
+        example_goal.calculate_targets()
+        db.add(example_goal)
+
+        db.commit()
+        print("\n数据库初始化完成！")
+        print(f"  - 视觉份量条目: {len(VISUAL_PORTIONS_DATA)}")
+        print(f"  - 覆盖食物: {len(set(d['food_name'] for d in VISUAL_PORTIONS_DATA))} 种")
+
+    except Exception as e:
+        print(f"\n初始化失败: {e}")
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    init_db()
+
+================================================================================
+文件：backend/app/main.py
+================================================================================
+
+"""
+智能食物记录 - 后端服务主入口
+"""
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from .models import Base, engine
+from .api import meal
+import uvicorn
+
+# 创建数据库表
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="智能食物记录 API", version="1.0.0")
+
+# CORS 中间件配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 注册路由
+app.include_router(meal.router)
+
+
+@app.get("/")
+async def root():
+    return {"message": "智能食物记录 API 服务运行中"}
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+================================================================================
+运行方式
+================================================================================
+
+# 安装依赖
+cd 智能食物记录/backend
+pip install -r requirements.txt
+
+# 初始化数据库
+python -m app.init_db
+
+# 启动服务
+python app/main.py
+# 或
+uvicorn app.main:app --reload
+
+服务地址: http://localhost:8000
+API文档: http://localhost:8000/docs
+
+================================================================================
+知识库数据统计
+================================================================================
+
+视觉份量条目: 63 条
+覆盖食物: 18 种
+
+肉类: 鸡胸肉、牛肉、猪肉、红烧肉、鱼、虾
+主食: 米饭、面条、馒头、全麦面包
+蔬菜: 青菜、生菜沙拉、西兰花、番茄、黄瓜
+水果: 苹果、香蕉、橙子、葡萄
+其他: 鸡蛋、豆腐
+
+================================================================================
+文件：backend/app/services/ai_service.py (新增)
+================================================================================
+
+"""
+AI 识别服务 - 集成智谱AI GLM-4.6V-Flash 图像识别
+支持真实AI识别和模拟降级
+"""
+
+# GLM API 配置
+GLM_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+GLM_MODEL = "glm-4.6v-flash"  # 免费视觉模型
+
+# 食物名称映射 - 将GLM识别结果映射到知识库标准名称
+FOOD_NAME_MAPPING = {
+    # 鸡肉类
+    "鸡胸肉": "鸡胸肉",
+    "鸡肉": "鸡胸肉",
+    "白切鸡": "鸡胸肉",
+    "宫保鸡丁": "鸡胸肉",
+    "口水鸡": "鸡胸肉",
+    "辣子鸡": "鸡胸肉",
+    # ... 更多映射（覆盖18种食物的多种变体）
+}
+
+# 核心类
+class AIService:
+    @classmethod
+    async def analyze_image(cls, image_base64: str) -> Tuple[str, bool]:
+        """分析食物图片，返回(食物名称, 是否使用真实AI)"""
+
+    @classmethod
+    async def analyze_image_with_glm(cls, image_base64: str) -> str:
+        """调用GLM API识别食物"""
+
+    @classmethod
+    def normalize_food_name(cls, raw_name: str) -> str:
+        """将GLM识别结果映射到知识库标准名称"""
+
+    @classmethod
+    def mock_analyze_image(cls, image_base64: str) -> str:
+        """模拟识别（降级方案）"""
+
+================================================================================
+文件：backend/app/api/meal.py (已更新)
+================================================================================
+
+更新内容：
+1. 导入 AIService 和 GLMError
+2. AnalyzeImageResponse 添加 ai_used 字段
+3. analyze_image 端点使用真实AI识别
+4. 添加日志记录
+5. 优化404错误响应（返回可用食物列表）
+
+================================================================================
+文件：backend/.env.example (新增)
+================================================================================
+
+# 智谱AI GLM API 配置
+GLM_API_KEY=your_glm_api_key_here
+
+================================================================================
+文件：backend/GLM_CONFIG.md (新增)
+================================================================================
+
+GLM 图像识别配置指南
+- 快速开始
+- API使用示例
+- 高级配置
+- 故障排查
+- 生产部署
+
+================================================================================
+文件：GLM_INTEGRATION_LOG.md (新增)
+================================================================================
+
+GLM AI 图像识别集成日志 - 核心问题跟踪文档
+- 问题编号：GLM-001
+- 版本号：v1.0.0
+- 处理状态：✅ 已完成
+- 创建日期：2026-01-16
+
+================================================================================
+文件：backend/requirements.txt (已更新)
+================================================================================
+
+新增依赖：
+httpx>=0.25.0  # HTTP客户端，用于调用GLM API
+
+================================================================================
